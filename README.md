@@ -101,17 +101,12 @@ JSON (--json scan.json)
 
 Array of host objects. Example:
 
-[  
-  {  
-    "ip": "192.168.1.10",  
-    "hostname": "nas.local",  
-    "ports": [  
-      {"port": 22,  "state": "open"},  
-      {"port": 80,  "state": "open"},  
-      {"port": 445, "state": "closed"}  
-    ]  
-  }  
-]  
+"ip": "192.168.1.10",  
+"hostname": "nas.local",  
+"ports":  
+{"port": 22,  "state": "open"},  
+{"port": 80,  "state": "open"},   
+{"port": 445, "state": "closed"}     
 
 ---
 
