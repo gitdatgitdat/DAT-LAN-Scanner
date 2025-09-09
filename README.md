@@ -71,7 +71,8 @@ The scanner prints a brief summary at the end:
 
 positional arguments:
 
-CIDR - Target subnet/range (e.g., 192.168.1.0/24)
+CIDR - 
+Target subnet/range (e.g., 192.168.1.0/24)
 
 optional arguments:
 
