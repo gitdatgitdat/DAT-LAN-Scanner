@@ -60,7 +60,7 @@ Turn up concurrency and tune TCP wait time:
 
 The scanner prints a brief summary at the end:
 
-=== Summary ===  
+```=== Summary ===```  
 Hosts up: 3  
 Total open ports found: 5  
 =================  
