@@ -71,24 +71,24 @@ The scanner prints a brief summary at the end:
 
 positional arguments:
 
-CIDR - 
+CIDR  
 Target subnet/range (e.g., 192.168.1.0/24)
 
 optional arguments:
 
-```--workers N``` -         
+```--workers N```         
 Max concurrent probes (default: sensible per system)
 
-```--port-timeout S``` -   
+```--port-timeout S```   
 TCP connect timeout per probe in seconds (default: 0.8–1.0)  
 
-```--rdns``` -              
+```--rdns```              
 Perform reverse DNS lookups for discovered IPs  
 
-```--json PATH``` -  
+```--json PATH```  
 Write full results to a JSON file  
 
-```--csv PATH``` -  
+```--csv PATH```  
 Write tabular results to a CSV file  
 
 Flags above reflect the current script. Run python scanner.py --help on your machine for the authoritative list and defaults.  
