@@ -44,6 +44,20 @@ class ICMP_ECHO_REPLY(ctypes.Structure):
 
 IP_SUCCESS = 0
 
+def pick_source_ip(target_ip: str) -> Optional[str]:
+    """
+    Return the local source IP the OS would use to reach target_ip.
+    Uses a UDP 'connect' (no packets sent) to consult routing table.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((target_ip, 53))   # port doesn't matter; no traffic is sent
+        src_ip = s.getsockname()[0]
+        s.close()
+        return src_ip
+    except Exception:
+        return None
+
 def icmp_ping(ip: str, timeout_ms: int = 400) -> Optional[int]:
     """Return RTT ms if reachable, else None."""
     handle = IcmpCreateFile()
@@ -75,11 +89,20 @@ def icmp_ping(ip: str, timeout_ms: int = 400) -> Optional[int]:
 
 # ---- Port scan -------------------------------------------------------------
 
-def tcp_connect(ip: str, port: int, timeout: float) -> bool:
+def tcp_connect(ip: str, port: int, timeout: float,
+                bind_ip: Optional[str] = None,
+                debug: bool = False) -> bool:
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except Exception:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        if bind_ip:
+            s.bind((bind_ip, 0))  # 0 = ephemeral port
+        s.connect((ip, port))
+        s.close()
+        return True
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] connect {bind_ip or '*'} -> {ip}:{port} failed: {type(e).__name__}: {e}")
         return False
 
 # ---- RDNS ------------------------------------------------------------------
@@ -109,10 +132,11 @@ def discover_hosts(cidr: str, timeout_ms: int, workers: int):
                 pass
     return sorted(live, key=lambda t: t[0])
 
-def scan_ports(ip: str, ports: list[int], timeout: float, workers: int):
+def scan_ports(ip: str, ports: list[int], timeout: float, workers: int,
+               bind_ip: Optional[str] = None, debug: bool = False):
     open_ports = []
     with ThreadPoolExecutor(max_workers=min(workers, len(ports) or 1)) as ex:
-        futs = {ex.submit(tcp_connect, ip, p, timeout): p for p in ports}
+        futs = {ex.submit(tcp_connect, ip, p, timeout, bind_ip, debug): p for p in ports}
         for fut in as_completed(futs):
             p = futs[fut]
             try:
@@ -163,6 +187,8 @@ def main():
     ap.add_argument("--rdns", action="store_true", help="Reverse-DNS live hosts.")
     ap.add_argument("--json", help="Write results to JSON.")
     ap.add_argument("--csv", help="Write results to CSV.")
+    ap.add_argument("--bind", help="Source IP to bind outgoing TCP connects (default: auto per target)")
+    ap.add_argument("--debug", action="store_true", help="Print connection errors")
     args = ap.parse_args()
 
     ports = parse_ports_arg(args.ports)
@@ -173,8 +199,16 @@ def main():
 
     results = []
     for ip, rtt in live:
+        src_ip = args.bind or pick_source_ip(ip)
         name = rdns(ip) if args.rdns else ip
-        open_ports = scan_ports(ip, ports, args.port_timeout, args.workers)
+        open_ports = scan_ports(
+            ip,
+            ports,
+            args.port_timeout,
+            args.workers,
+            bind_ip=src_ip,
+            debug=args.debug,
+        )
         results.append({
             "ip": ip,
             "name": name,
