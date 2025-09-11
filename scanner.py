@@ -59,30 +59,29 @@ def pick_source_ip(target_ip: str) -> Optional[str]:
         return None
 
 def icmp_ping(ip: str, timeout_ms: int = 400) -> Optional[int]:
-    """Return RTT ms if reachable, else None."""
     handle = IcmpCreateFile()
     if handle == HANDLE(-1).value:
         return None
     try:
-        data = b"DAT"
-        reply = (ctypes.c_ubyte * 64)()
-        reply_ptr = ctypes.byref(reply)
+        payload = b"DAT"
+        # Microsoft docs: buffer must be large enough for ICMP_ECHO_REPLY + data
+        buf = ctypes.create_string_buffer(1024)  # bigger, safer
         ip_dword = DWORD(int(ipaddress.IPv4Address(ip)))
         opt = IP_OPTION_INFORMATION(64, 0, 0, 0, None)
 
         ret = IcmpSendEcho(
             handle,
             ip_dword,
-            ctypes.c_char_p(data),
-            USHORT(len(data)),
+            ctypes.c_char_p(payload),
+            USHORT(len(payload)),
             ctypes.byref(opt),
-            reply_ptr,
-            DWORD(ctypes.sizeof(reply)),
+            ctypes.byref(buf),
+            DWORD(ctypes.sizeof(buf)),
             DWORD(timeout_ms),
         )
         if ret > 0:
-            r = ctypes.cast(reply_ptr, ctypes.POINTER(ICMP_ECHO_REPLY)).contents
-            return int(r.RoundTripTime)
+            rep = ctypes.cast(ctypes.byref(buf), ctypes.POINTER(ICMP_ECHO_REPLY)).contents
+            return int(rep.RoundTripTime)
         return None
     finally:
         IcmpCloseHandle(handle)
@@ -115,6 +114,9 @@ def rdns(ip: str) -> str:
 
 # ---- Main Workflow ---------------------------------------------------------
 
+def fmt_rtt(rtt):
+    return f"{int(rtt):>3}" if isinstance(rtt, (int, float)) else "--"
+
 def discover_hosts(cidr: str, timeout_ms: int, workers: int):
     net = ipaddress.ip_network(cidr, strict=False)
     addrs = [str(ip) for ip in net.hosts()]
@@ -128,6 +130,35 @@ def discover_hosts(cidr: str, timeout_ms: int, workers: int):
                 rtt = fut.result()
                 if rtt is not None:
                     live.append((ip, rtt))
+            except Exception:
+                pass
+    return sorted(live, key=lambda t: t[0])
+
+def tcp_discover_hosts(cidr: str,
+                       probe_ports: list[int],
+                       timeout: float,
+                       workers: int,
+                       bind: Optional[str],
+                       debug: bool):
+    net = ipaddress.ip_network(cidr, strict=False)
+    addrs = [str(ip) for ip in net.hosts()]
+    live = []
+
+    def probe(ip: str) -> Optional[str]:
+        src_ip = bind or pick_source_ip(ip)
+        for p in probe_ports:
+            if tcp_connect(ip, p, timeout, bind_ip=src_ip, debug=debug):
+                return ip
+        return None
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(probe, ip): ip for ip in addrs}
+        for fut in as_completed(futs):
+            ip = futs[fut]
+            try:
+                ok = fut.result()
+                if ok:
+                    live.append((ip, None))  # RTT unknown for TCP discovery
             except Exception:
                 pass
     return sorted(live, key=lambda t: t[0])
@@ -183,6 +214,10 @@ def main():
     ap.add_argument("--workers", type=int, default=256, help="Max concurrent workers.")
     ap.add_argument("--ports", default="22,80,135,139,443,445,3389,8080",
                     help="Comma/range list of TCP ports to check on live hosts.")
+    ap.add_argument("--discovery", choices=["icmp", "tcp", "both"], default="both",
+                help="How to discover live hosts before port scan.")
+    ap.add_argument("--probe-ports", default="80,443,22,3389,445",
+                help="Ports to try for TCP discovery when enabled.")
     ap.add_argument("--port-timeout", type=float, default=0.6, help="TCP connect timeout (s).")
     ap.add_argument("--rdns", action="store_true", help="Reverse-DNS live hosts.")
     ap.add_argument("--json", help="Write results to JSON.")
@@ -190,11 +225,25 @@ def main():
     ap.add_argument("--bind", help="Source IP to bind outgoing TCP connects (default: auto per target)")
     ap.add_argument("--debug", action="store_true", help="Print connection errors")
     args = ap.parse_args()
+    if args.port_timeout <= 0:
+        args.port_timeout = 0.6
 
     ports = parse_ports_arg(args.ports)
+    probe_ports = parse_ports_arg(args.probe_ports)
 
     print(f"[*] Discovering hosts in {args.cidr} …")
-    live = discover_hosts(args.cidr, args.icmp_timeout, args.workers)
+    live = []
+
+    if args.discovery in ("icmp", "both"):
+        live = discover_hosts(args.cidr, args.icmp_timeout, args.workers)
+
+    if args.discovery in ("tcp", "both"):
+        # add any hosts found via TCP that ICMP missed
+        tcp_live = tcp_discover_hosts(args.cidr, probe_ports, args.port_timeout,
+                                  args.workers, args.bind, args.debug)
+        icmp_set = {ip for ip, _ in live}
+        live.extend(h for h in tcp_live if h[0] not in icmp_set)
+
     print(f"[*] Live hosts: {len(live)}")
 
     results = []
@@ -216,7 +265,7 @@ def main():
             "open_ports": open_ports,
         })
         ports_str = ",".join(map(str, open_ports)) or "-"
-        print(f"  {name:<40} rtt={rtt:>3} ms  open=[{ports_str}]")
+        print(f"  {name:<40} rtt={fmt_rtt(rtt)} ms  open=[{ports_str}]")
 
     if args.json:
         to_json(args.json, results)
