@@ -224,6 +224,8 @@ def main():
     ap.add_argument("--csv", help="Write results to CSV.")
     ap.add_argument("--bind", help="Source IP to bind outgoing TCP connects (default: auto per target)")
     ap.add_argument("--debug", action="store_true", help="Print connection errors")
+    ap.add_argument("--show-all", action="store_true",
+                help="Print all live hosts, even if no ports are open.")
     args = ap.parse_args()
     if args.port_timeout <= 0:
         args.port_timeout = 0.6
@@ -250,6 +252,7 @@ def main():
     for ip, rtt in live:
         src_ip = args.bind or pick_source_ip(ip)
         name = rdns(ip) if args.rdns else ip
+
         open_ports = scan_ports(
             ip,
             ports,
@@ -258,14 +261,18 @@ def main():
             bind_ip=src_ip,
             debug=args.debug,
         )
+
         results.append({
             "ip": ip,
             "name": name,
             "rtt_ms": rtt,
             "open_ports": open_ports,
         })
-        ports_str = ",".join(map(str, open_ports)) or "-"
-        print(f"  {name:<40} rtt={fmt_rtt(rtt)} ms  open=[{ports_str}]")
+
+        if args.show_all or open_ports:
+            rtt_str = fmt_rtt(rtt)
+            ports_str = ", ".join(map(str, open_ports)) if open_ports else "-"
+            print(f"[+] {name} ({ip}) is UP  rtt={rtt_str} ms  open ports: {ports_str}")
 
     if args.json:
         to_json(args.json, results)
