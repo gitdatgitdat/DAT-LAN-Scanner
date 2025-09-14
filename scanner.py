@@ -4,10 +4,14 @@ import socket
 import csv
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import ctypes
 from ctypes import wintypes
+from functools import lru_cache
+import platform
+
+VERSION = "0.2.0"
 
 # ---- Windows ICMP (no admin, no deps) --------------------------------------
 
@@ -80,7 +84,8 @@ def icmp_ping(ip: str, timeout_ms: int = 400) -> Optional[int]:
             DWORD(timeout_ms),
         )
         if ret > 0:
-            rep = ctypes.cast(ctypes.byref(buf), ctypes.POINTER(ICMP_ECHO_REPLY)).contents
+            # cast the buffer directly
+            rep = ctypes.cast(buf, ctypes.POINTER(ICMP_ECHO_REPLY)).contents
             return int(rep.RoundTripTime)
         return None
     finally:
@@ -104,13 +109,22 @@ def tcp_connect(ip: str, port: int, timeout: float,
             print(f"[DEBUG] connect {bind_ip or '*'} -> {ip}:{port} failed: {type(e).__name__}: {e}")
         return False
 
-# ---- RDNS ------------------------------------------------------------------
+# ---- RDNS & service names (cached) ----------------------------------------
 
+@lru_cache(maxsize=4096)
 def rdns(ip: str) -> str:
     try:
         return socket.gethostbyaddr(ip)[0]
     except Exception:
         return ip
+
+@lru_cache(maxsize=512)
+def service_name(p: int) -> str:
+    try:
+        return socket.getservbyport(p, "tcp")
+    except Exception:
+        fallback = {22:"ssh", 80:"http", 443:"https", 445:"microsoft-ds", 3389:"rdp", 5357:"wsdapi"}
+        return fallback.get(p, "?")
 
 # ---- Main Workflow ---------------------------------------------------------
 
@@ -177,9 +191,10 @@ def scan_ports(ip: str, ports: list[int], timeout: float, workers: int,
                 pass
     return sorted(open_ports)
 
-def to_json(path: str, rows: list[dict]):
+def to_json(path: str, rows: list[dict], meta: dict | None = None):
+    payload = {"_meta": meta or {}, "items": rows}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 def to_csv(path: str, rows: list[dict]):
     if not rows:
@@ -215,9 +230,9 @@ def main():
     ap.add_argument("--ports", default="22,80,135,139,443,445,3389,8080",
                     help="Comma/range list of TCP ports to check on live hosts.")
     ap.add_argument("--discovery", choices=["icmp", "tcp", "both"], default="both",
-                help="How to discover live hosts before port scan.")
+                    help="How to discover live hosts before port scan.")
     ap.add_argument("--probe-ports", default="80,443,22,3389,445",
-                help="Ports to try for TCP discovery when enabled.")
+                    help="Ports to try for TCP discovery when enabled.")
     ap.add_argument("--port-timeout", type=float, default=0.6, help="TCP connect timeout (s).")
     ap.add_argument("--rdns", action="store_true", help="Reverse-DNS live hosts.")
     ap.add_argument("--json", help="Write results to JSON.")
@@ -225,15 +240,28 @@ def main():
     ap.add_argument("--bind", help="Source IP to bind outgoing TCP connects (default: auto per target)")
     ap.add_argument("--debug", action="store_true", help="Print connection errors")
     ap.add_argument("--show-all", action="store_true",
-                help="Print all live hosts, even if no ports are open.")
+                    help="Print all live hosts, even if no ports are open.")
+    ap.add_argument("--quiet", action="store_true", help="Only print final summary.")
+    ap.add_argument("--summary-only", action="store_true",
+                    help="Per-host lines + final summary; suppress debug noise.")
+    ap.add_argument("--version", action="version", version=f"DAT LAN Scanner {VERSION}")
     args = ap.parse_args()
-    if args.port_timeout <= 0:
-        args.port_timeout = 0.6
+
+    # clamp / normalize
+    args.workers = max(1, min(int(args.workers), 1024))
+    args.port_timeout = max(0.05, float(args.port_timeout))
+    args.icmp_timeout = max(100, int(args.icmp_timeout))
+    if args.quiet:
+        args.debug = False
+    if args.summary_only:
+        args.debug = False
 
     ports = parse_ports_arg(args.ports)
     probe_ports = parse_ports_arg(args.probe_ports)
 
-    print(f"[*] Discovering hosts in {args.cidr} …")
+    if not args.quiet:
+        print(f"[*] Discovering hosts in {args.cidr} …")
+
     live = []
 
     if args.discovery in ("icmp", "both"):
@@ -242,11 +270,12 @@ def main():
     if args.discovery in ("tcp", "both"):
         # add any hosts found via TCP that ICMP missed
         tcp_live = tcp_discover_hosts(args.cidr, probe_ports, args.port_timeout,
-                                  args.workers, args.bind, args.debug)
+                                      args.workers, args.bind, args.debug)
         icmp_set = {ip for ip, _ in live}
         live.extend(h for h in tcp_live if h[0] not in icmp_set)
 
-    print(f"[*] Live hosts: {len(live)}")
+    if not args.quiet:
+        print(f"[*] Live hosts: {len(live)}")
 
     results = []
     for ip, rtt in live:
@@ -267,26 +296,58 @@ def main():
             "name": name,
             "rtt_ms": rtt,
             "open_ports": open_ports,
+            "open_services": [service_name(p) for p in open_ports],
         })
 
-        if args.show_all or open_ports:
+        if not args.quiet and (args.show_all or open_ports):
             rtt_str = fmt_rtt(rtt)
-            ports_str = ", ".join(map(str, open_ports)) if open_ports else "-"
+            if open_ports:
+                ports_str = ", ".join(f"{p}({service_name(p)})" for p in open_ports)
+            else:
+                ports_str = "-"
             print(f"[+] {name} ({ip}) is UP  rtt={rtt_str} ms  open ports: {ports_str}")
 
+    # Output files (with metadata for JSON)
+    meta = {
+        "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "cidr": args.cidr,
+        "discovery": args.discovery,
+        "probe_ports": probe_ports,
+        "ports": ports,
+        "bind": args.bind or "auto",
+        "workers": args.workers,
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "version": VERSION,
+    }
+
     if args.json:
-        to_json(args.json, results)
-        print(f"[*] Wrote JSON: {args.json}")
+        to_json(args.json, results, meta)
+        if not args.quiet:
+            print(f"[*] Wrote JSON: {args.json}")
     if args.csv:
         to_csv(args.csv, results)
-        print(f"[*] Wrote CSV : {args.csv}")
+        if not args.quiet:
+            print(f"[*] Wrote CSV : {args.csv}")
 
     # Summary
     total_open = sum(len(r["open_ports"]) for r in results)
-    print("\n=== Summary ===")
-    print(f"Hosts up: {len(results)}")
-    print(f"Total open ports found: {total_open}")
-    print("===============")
+    if not args.quiet or args.summary_only or True:
+        print("\n=== Summary ===")
+        print(f"Hosts up: {len(results)}")
+        print(f"Total open ports found: {total_open}")
+        for r in results:
+            ports_str = ", ".join(f"{p}({service_name(p)})" for p in r["open_ports"]) or "-"
+            rtt_str = fmt_rtt(r["rtt_ms"])
+            print(f"  - {r['name']} ({r['ip']})  rtt={rtt_str} ms  open: {ports_str}")
+        print("===============")
+
+    # Exit codes for CI / scripting
+    if len(results) == 0:
+        raise SystemExit(2)   # no live hosts
+    if total_open == 0:
+        raise SystemExit(1)   # hosts but no open ports
+    raise SystemExit(0)
 
 if __name__ == "__main__":
     main()
